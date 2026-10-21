@@ -716,6 +716,89 @@ else
 fi
 
 # ============================================================
+echo "=== Test 28: streamed messages are billed once across transcript files ==="
+# ============================================================
+usage_field() { echo "$1" | sed -n "s/^$2=//p"; }
+make_identified_line() {
+    make_jsonl_line "$1" "claude-opus-4" "$2" "$3" "$4" "$5" "$6" \
+        | jq -c --arg mid "$7" --arg rid "$8" '.message.id = $mid | .requestId = $rid'
+}
+ENV28=$(setup_env "test28")
+cp "$ENV6/.claude/pricing-cache.json" "$ENV28/.claude/pricing-cache.json"
+{
+    for out in 1 1 1 1 327; do
+        make_identified_line "$TODAY" 2 "$out" 15030 8655 original msg-stream req-stream
+    done
+} > "$ENV28/.claude/projects/test-project/stream.jsonl"
+# A resumed session copies the original message with its counters zeroed.
+make_identified_line "$TODAY" 0 0 0 0 resumed msg-stream req-stream \
+    > "$ENV28/.claude/projects/test-project/resumed.jsonl"
+OUTPUT28=$(run_script "$ENV28")
+assert_eq "$(usage_field "$OUTPUT28" WEEK_TOKENS)" "24014" "streamed input/cache count once and output reaches final value"
+assert_eq "$(usage_field "$OUTPUT28" WEEK_MESSAGES)" "1" "one message despite streamed blocks and resumed copy"
+assert_eq "$(usage_field "$OUTPUT28" WEEK_SESSIONS)" "1" "zeroed resume does not add a billed session"
+assert_match "$(usage_field "$OUTPUT28" WEEK_MODELS)" "opus=24014" "model totals use deduplicated tokens"
+assert_eq "$(usage_field "$OUTPUT28" TODAY_COST)" "0.21" "cost uses deduplicated counters"
+assert_eq "$(echo "$(usage_field "$OUTPUT28" DAILY)" | cut -d, -f$((TODAY_IDX + 1)))" "24014" "daily activity uses deduplicated tokens"
+
+# Reverse row order: maxima must not depend on traversal or stream order.
+{ make_identified_line "$TODAY" 0 0 0 0 resumed msg-stream req-stream
+  make_identified_line "$TODAY" 2 327 15030 8655 original msg-stream req-stream
+  make_identified_line "$TODAY" 2 1 15030 8655 original msg-stream req-stream
+} > "$ENV28/.claude/projects/test-project/stream.jsonl"
+rm "$ENV28/.claude/projects/test-project/resumed.jsonl"
+OUTPUT28B=$(run_script "$ENV28")
+assert_eq "$(usage_field "$OUTPUT28B" WEEK_TOKENS)" "24014" "zero-first and reversed stream retain all usage"
+assert_eq "$(usage_field "$OUTPUT28B" WEEK_SESSIONS)" "1" "metadata comes from billed record"
+
+# Nonzero copies across dates keep the earliest billed day. A zeroed copy
+# in the current window must not move an old message into today's totals.
+ENV29=$(setup_env "test29")
+OLD_DATE=$(date -d "$(date +%Y-%m-01) - 7 days" +%Y-%m-%d)
+make_identified_line "$OLD_DATE" 100 20 0 0 original msg-old req-old \
+    > "$ENV29/.claude/projects/test-project/original.jsonl"
+touch -d '90 days ago' "$ENV29/.claude/projects/test-project/original.jsonl"
+{
+    make_identified_line "$TODAY" 100 20 0 0 resumed msg-old req-old
+    make_identified_line "$TODAY" 0 0 0 0 resumed msg-old req-old
+} > "$ENV29/.claude/projects/test-project/resumed.jsonl"
+OUTPUT29=$(run_script "$ENV29")
+assert_eq "$(usage_field "$OUTPUT29" WEEK_TOKENS)" "0" "resumed message stays outside current week"
+assert_eq "$(usage_field "$OUTPUT29" MONTH_TOKENS)" "0" "resumed message stays outside current month"
+assert_eq "$(usage_field "$OUTPUT29" DAILY)" "0,0,0,0,0,0,0" "resumed message keeps original date"
+
+# Same message id with different request ids represents distinct calls.
+# Incomplete or absent identities must never collapse unrelated legacy rows.
+ENV30=$(setup_env "test30")
+{
+    make_identified_line "$TODAY" 10 0 0 0 sess shared req-a
+    make_identified_line "$TODAY" 20 0 0 0 sess shared req-b
+    make_identified_line "$TODAY" 30 0 0 0 sess shared ''
+    make_identified_line "$TODAY" 40 0 0 0 sess shared ''
+    make_identified_line "$TODAY" 50 0 0 0 sess '' req-c
+    make_identified_line "$TODAY" 60 0 0 0 sess '' req-c
+    make_jsonl_line "$TODAY" claude-opus-4 70 0 0 0 sess
+    make_jsonl_line "$TODAY" claude-opus-4 80 0 0 0 sess
+} > "$ENV30/.claude/projects/test-project/test.jsonl"
+OUTPUT30=$(run_script "$ENV30")
+assert_eq "$(usage_field "$OUTPUT30" WEEK_TOKENS)" "360" "distinct requests and incomplete identities are counted independently"
+assert_eq "$(usage_field "$OUTPUT30" WEEK_MESSAGES)" "8" "legacy rows do not collapse into one message"
+
+# Every usage field takes its maximum; profiles keep separate billing identities.
+ENV31=$(setup_env "test31")
+{
+    make_identified_line "$TODAY" 10 0 30 0 sess same same
+    make_identified_line "$TODAY" 0 20 0 40 sess same same
+} > "$ENV31/.claude/projects/test-project/test.jsonl"
+mkdir -p "$ENV31/.ccs/instances/work/projects/p"
+make_identified_line "$TODAY" 50 0 0 0 work same same \
+    > "$ENV31/.ccs/instances/work/projects/p/test.jsonl"
+OUTPUT31=$(run_script "$ENV31")
+assert_eq "$(usage_field "$OUTPUT31" WEEK_TOKENS)" "150" "each field uses its maximum and separate profiles do not deduplicate each other"
+assert_eq "$(usage_field "$OUTPUT31" WEEK_MESSAGES)" "2" "one deduplicated message per profile"
+assert_match "$(usage_field "$OUTPUT31" PROFILE_WEEK_TOKENS)" "default:100,work:50" "profile totals stay independent"
+
+# ============================================================
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
