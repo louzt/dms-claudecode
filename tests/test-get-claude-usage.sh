@@ -27,11 +27,23 @@ setup_env() {
     echo "$dir"
 }
 
-# Mock curl: always returns empty JSON (avoids real network calls)
+# Mock curl: returns empty JSON for everything except the usage endpoint
+# (avoids real network calls). The usage endpoint honours:
+#   MOCK_USAGE_BODY  response body            (default '{}')
+#   MOCK_USAGE_CODE  HTTP status printed by -w (default 200)
+#   MOCK_USAGE_FAIL  non-empty: exit 6 with no output, like a network failure
+#   MOCK_CURL_LOG    file that gets one line per usage request
 mock_curl="$TMPDIR_ROOT/curl"
 cat > "$mock_curl" << 'CURLEOF'
 #!/usr/bin/env bash
-echo '{}'
+case "$*" in
+    *api/oauth/usage*)
+        [ -n "${MOCK_CURL_LOG:-}" ] && echo "usage" >> "$MOCK_CURL_LOG"
+        [ -n "${MOCK_USAGE_FAIL:-}" ] && exit 6
+        printf '%s\n%s' "${MOCK_USAGE_BODY:-{\}}" "${MOCK_USAGE_CODE:-200}"
+        ;;
+    *) echo '{}' ;;
+esac
 CURLEOF
 chmod +x "$mock_curl"
 
@@ -51,12 +63,12 @@ make_jsonl_line() {
 }
 
 # ============================================================
-echo "=== Test 1: Output format — all 21 keys present ==="
+echo "=== Test 1: Output format — all 22 keys present ==="
 # ============================================================
 ENV1=$(setup_env "test1")
 OUTPUT1=$(run_script "$ENV1")
 
-EXPECTED_KEYS="SUBSCRIPTION_TYPE RATE_LIMIT_TIER FIVE_HOUR_UTIL FIVE_HOUR_RESET SEVEN_DAY_UTIL SEVEN_DAY_RESET EXTRA_USAGE_ENABLED WEEK_MESSAGES WEEK_SESSIONS WEEK_TOKENS WEEK_MODELS ALLTIME_SESSIONS ALLTIME_MESSAGES FIRST_SESSION DAILY MONTH_TOKENS TODAY_COST WEEK_COST MONTH_COST DAILY_COSTS USD_EUR_RATE"
+EXPECTED_KEYS="SUBSCRIPTION_TYPE RATE_LIMIT_TIER FIVE_HOUR_UTIL FIVE_HOUR_RESET SEVEN_DAY_UTIL SEVEN_DAY_RESET EXTRA_USAGE_ENABLED AUTH_STATE WEEK_MESSAGES WEEK_SESSIONS WEEK_TOKENS WEEK_MODELS ALLTIME_SESSIONS ALLTIME_MESSAGES FIRST_SESSION DAILY MONTH_TOKENS TODAY_COST WEEK_COST MONTH_COST DAILY_COSTS USD_EUR_RATE"
 for key in $EXPECTED_KEYS; do
     if echo "$OUTPUT1" | grep -q "^${key}="; then
         pass "key $key present"
@@ -714,6 +726,209 @@ if echo "$PROFILES27C" | tr ',' '\n' | grep -q '^alias$'; then
 else
     pass "duplicate config directory registered only once"
 fi
+
+
+# ============================================================
+echo "=== Test 28: AUTH_STATE — live response is ok ==="
+# ============================================================
+VALID_BODY='{"five_hour":{"utilization":55,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":20,"resets_at":"2099-01-07T00:00:00Z"},"extra_usage":{"is_enabled":false}}'
+make_creds() {
+    # make_creds <env> [expiresAt-ms] [accessToken]
+    local env="$1" exp="${2:-4102444800000}" tok="${3-fake-token}"
+    cat > "$env/.claude/.credentials.json" << CREDEOF
+{"claudeAiOauth":{"subscriptionType":"pro","rateLimitTier":"t1_pro","accessToken":"$tok","expiresAt":$exp}}
+CREDEOF
+}
+auth_state_of() { echo "$1" | grep "^AUTH_STATE=" | cut -d= -f2; }
+
+ENV28=$(setup_env "test28")
+make_creds "$ENV28"
+OUTPUT28=$(MOCK_USAGE_BODY="$VALID_BODY" run_script "$ENV28")
+assert_eq "$(auth_state_of "$OUTPUT28")" "ok" "live response: AUTH_STATE=ok"
+assert_eq "$(echo "$OUTPUT28" | grep "^FIVE_HOUR_UTIL=" | cut -d= -f2)" "55" "live response: usage still parsed"
+assert_match "$OUTPUT28" "^PROFILE_AUTH_STATE=default:ok$" "live response: PROFILE_AUTH_STATE lists default:ok"
+
+# ============================================================
+echo "=== Test 29: AUTH_STATE — missing credentials ==="
+# ============================================================
+ENV29=$(setup_env "test29")
+OUTPUT29=$(run_script "$ENV29")
+assert_eq "$(auth_state_of "$OUTPUT29")" "missing" "no credentials file: AUTH_STATE=missing"
+
+ENV29B=$(setup_env "test29b")
+make_creds "$ENV29B" 4102444800000 ""
+OUTPUT29B=$(run_script "$ENV29B")
+assert_eq "$(auth_state_of "$OUTPUT29B")" "missing" "empty accessToken: AUTH_STATE=missing"
+
+# ============================================================
+echo "=== Test 30: AUTH_STATE — expired ==="
+# ============================================================
+ENV30=$(setup_env "test30")
+make_creds "$ENV30"
+for code in 401 403; do
+    OUTPUT30=$(MOCK_USAGE_CODE="$code" run_script "$ENV30")
+    assert_eq "$(auth_state_of "$OUTPUT30")" "expired" "HTTP $code: AUTH_STATE=expired"
+done
+
+ENV30B=$(setup_env "test30b")
+make_creds "$ENV30B" 1000
+OUTPUT30B=$(MOCK_USAGE_FAIL=1 run_script "$ENV30B")
+assert_eq "$(auth_state_of "$OUTPUT30B")" "expired" "expiresAt in the past + failed call: AUTH_STATE=expired"
+
+# ============================================================
+echo "=== Test 31: AUTH_STATE — rate limited ==="
+# ============================================================
+ENV31=$(setup_env "test31")
+make_creds "$ENV31"
+OUTPUT31=$(MOCK_USAGE_CODE=429 run_script "$ENV31")
+assert_eq "$(auth_state_of "$OUTPUT31")" "rate_limited" "HTTP 429: AUTH_STATE=rate_limited"
+
+ENV31B=$(setup_env "test31b")
+make_creds "$ENV31B" 1000
+OUTPUT31B=$(MOCK_USAGE_CODE=429 run_script "$ENV31B")
+assert_eq "$(auth_state_of "$OUTPUT31B")" "rate_limited" "HTTP 429 wins over a past expiresAt"
+
+# ============================================================
+echo "=== Test 32: AUTH_STATE — stale keeps cached values ==="
+# ============================================================
+ENV32=$(setup_env "test32")
+make_creds "$ENV32"
+OLD_TS=$(( $(date +%s) - 3600 ))
+cat > "$ENV32/.claude/usage-cache.json" << CACHEEOF
+{"cached_at": $OLD_TS, "identity": "$ENV32/.claude/.credentials.json", "data": $VALID_BODY}
+CACHEEOF
+OUTPUT32=$(MOCK_USAGE_CODE=500 run_script "$ENV32")
+assert_eq "$(auth_state_of "$OUTPUT32")" "stale" "HTTP 500 with cache: AUTH_STATE=stale"
+assert_eq "$(echo "$OUTPUT32" | grep "^FIVE_HOUR_UTIL=" | cut -d= -f2)" "55" "stale: cached FIVE_HOUR_UTIL still emitted"
+
+OUTPUT32B=$(MOCK_USAGE_FAIL=1 run_script "$ENV32")
+assert_eq "$(auth_state_of "$OUTPUT32B")" "stale" "network failure: AUTH_STATE=stale"
+
+# A cache that belongs to another profile must not be used as the fallback
+sed -i "s|$ENV32/.claude/.credentials.json|$ENV32/other/.credentials.json|" "$ENV32/.claude/usage-cache.json"
+OUTPUT32C=$(MOCK_USAGE_CODE=500 run_script "$ENV32")
+assert_eq "$(echo "$OUTPUT32C" | grep "^FIVE_HOUR_UTIL=" | cut -d= -f2)" "0" "stale: foreign cache not used as fallback"
+
+# ============================================================
+echo "=== Test 33: AUTH_STATE — fresh cache makes no request and is ok ==="
+# ============================================================
+ENV33=$(setup_env "test33")
+make_creds "$ENV33" 1000
+cat > "$ENV33/.claude/usage-cache.json" << CACHEEOF
+{"cached_at": $(date +%s), "identity": "$ENV33/.claude/.credentials.json", "data": $VALID_BODY}
+CACHEEOF
+CURL_LOG33="$TMPDIR_ROOT/curl33.log"
+: > "$CURL_LOG33"
+OUTPUT33=$(MOCK_CURL_LOG="$CURL_LOG33" MOCK_USAGE_CODE=401 run_script "$ENV33")
+assert_eq "$(auth_state_of "$OUTPUT33")" "ok" "fresh cache: AUTH_STATE=ok"
+assert_eq "$(wc -l < "$CURL_LOG33")" "0" "fresh cache: no usage request made"
+
+# ============================================================
+echo "=== Test 34: PROFILE_AUTH_STATE — per profile, default drives AUTH_STATE ==="
+# ============================================================
+ENV34=$(setup_env "test34")
+make_creds "$ENV34"
+mkdir -p "$ENV34/.ccs/instances/work/projects/proj1"
+OUTPUT34=$(MOCK_USAGE_BODY="$VALID_BODY" run_script "$ENV34")
+assert_match "$OUTPUT34" "^PROFILE_AUTH_STATE=default:ok,work:missing$" "per-profile states: default ok, work missing"
+assert_eq "$(auth_state_of "$OUTPUT34")" "ok" "AUTH_STATE mirrors the default profile"
+
+# ============================================================
+echo "=== Test 35: the access token never appears in output ==="
+# ============================================================
+ENV35=$(setup_env "test35")
+make_creds "$ENV35" 4102444800000 "SECRET-TOKEN-VALUE"
+for code in 200 401 429 500; do
+    OUTPUT35=$(MOCK_USAGE_CODE="$code" run_script "$ENV35")
+    if echo "$OUTPUT35" | grep -q "SECRET-TOKEN-VALUE"; then
+        fail "token leaked in output (HTTP $code)"
+    else
+        pass "token absent from output (HTTP $code)"
+    fi
+done
+
+# ============================================================
+echo "=== Test 36: streamed messages are billed once across transcript files ==="
+# ============================================================
+usage_field() { echo "$1" | sed -n "s/^$2=//p"; }
+make_identified_line() {
+    make_jsonl_line "$1" "claude-opus-4" "$2" "$3" "$4" "$5" "$6" \
+        | jq -c --arg mid "$7" --arg rid "$8" '.message.id = $mid | .requestId = $rid'
+}
+ENV36=$(setup_env "test36")
+cp "$ENV6/.claude/pricing-cache.json" "$ENV36/.claude/pricing-cache.json"
+{
+    for out in 1 1 1 1 327; do
+        make_identified_line "$TODAY" 2 "$out" 15030 8655 original msg-stream req-stream
+    done
+} > "$ENV36/.claude/projects/test-project/stream.jsonl"
+# A resumed session copies the original message with its counters zeroed.
+make_identified_line "$TODAY" 0 0 0 0 resumed msg-stream req-stream \
+    > "$ENV36/.claude/projects/test-project/resumed.jsonl"
+OUTPUT36=$(run_script "$ENV36")
+assert_eq "$(usage_field "$OUTPUT36" WEEK_TOKENS)" "24014" "streamed input/cache count once and output reaches final value"
+assert_eq "$(usage_field "$OUTPUT36" WEEK_MESSAGES)" "1" "one message despite streamed blocks and resumed copy"
+assert_eq "$(usage_field "$OUTPUT36" WEEK_SESSIONS)" "1" "zeroed resume does not add a billed session"
+assert_match "$(usage_field "$OUTPUT36" WEEK_MODELS)" "opus=24014" "model totals use deduplicated tokens"
+assert_eq "$(usage_field "$OUTPUT36" TODAY_COST)" "0.21" "cost uses deduplicated counters"
+assert_eq "$(usage_field "$OUTPUT36" DAILY | cut -d, -f$((TODAY_IDX + 1)))" "24014" "daily activity uses deduplicated tokens"
+
+# Reverse row order: maxima must not depend on traversal or stream order.
+{ make_identified_line "$TODAY" 0 0 0 0 resumed msg-stream req-stream
+  make_identified_line "$TODAY" 2 327 15030 8655 original msg-stream req-stream
+  make_identified_line "$TODAY" 2 1 15030 8655 original msg-stream req-stream
+} > "$ENV36/.claude/projects/test-project/stream.jsonl"
+rm "$ENV36/.claude/projects/test-project/resumed.jsonl"
+OUTPUT36B=$(run_script "$ENV36")
+assert_eq "$(usage_field "$OUTPUT36B" WEEK_TOKENS)" "24014" "zero-first and reversed stream retain all usage"
+assert_eq "$(usage_field "$OUTPUT36B" WEEK_SESSIONS)" "1" "metadata comes from billed record"
+
+# Nonzero copies across dates keep the earliest billed day. A zeroed copy
+# in the current window must not move an old message into today's totals.
+ENV37=$(setup_env "test37")
+OLD_DATE=$(date -d "$(date +%Y-%m-01) - 7 days" +%Y-%m-%d)
+make_identified_line "$OLD_DATE" 100 20 0 0 original msg-old req-old \
+    > "$ENV37/.claude/projects/test-project/original.jsonl"
+touch -d '90 days ago' "$ENV37/.claude/projects/test-project/original.jsonl"
+{
+    make_identified_line "$TODAY" 100 20 0 0 resumed msg-old req-old
+    make_identified_line "$TODAY" 0 0 0 0 resumed msg-old req-old
+} > "$ENV37/.claude/projects/test-project/resumed.jsonl"
+OUTPUT37=$(run_script "$ENV37")
+assert_eq "$(usage_field "$OUTPUT37" WEEK_TOKENS)" "0" "resumed message stays outside current week"
+assert_eq "$(usage_field "$OUTPUT37" MONTH_TOKENS)" "0" "resumed message stays outside current month"
+assert_eq "$(usage_field "$OUTPUT37" DAILY)" "0,0,0,0,0,0,0" "resumed message keeps original date"
+
+# Same message id with different request ids represents distinct calls.
+# Incomplete or absent identities must never collapse unrelated legacy rows.
+ENV38=$(setup_env "test38")
+{
+    make_identified_line "$TODAY" 10 0 0 0 sess shared req-a
+    make_identified_line "$TODAY" 20 0 0 0 sess shared req-b
+    make_identified_line "$TODAY" 30 0 0 0 sess shared ''
+    make_identified_line "$TODAY" 40 0 0 0 sess shared ''
+    make_identified_line "$TODAY" 50 0 0 0 sess '' req-c
+    make_identified_line "$TODAY" 60 0 0 0 sess '' req-c
+    make_jsonl_line "$TODAY" claude-opus-4 70 0 0 0 sess
+    make_jsonl_line "$TODAY" claude-opus-4 80 0 0 0 sess
+} > "$ENV38/.claude/projects/test-project/test.jsonl"
+OUTPUT38=$(run_script "$ENV38")
+assert_eq "$(usage_field "$OUTPUT38" WEEK_TOKENS)" "360" "distinct requests and incomplete identities are counted independently"
+assert_eq "$(usage_field "$OUTPUT38" WEEK_MESSAGES)" "8" "legacy rows do not collapse into one message"
+
+# Every usage field takes its maximum; profiles keep separate billing identities.
+ENV39=$(setup_env "test39")
+{
+    make_identified_line "$TODAY" 10 0 30 0 sess same same
+    make_identified_line "$TODAY" 0 20 0 40 sess same same
+} > "$ENV39/.claude/projects/test-project/test.jsonl"
+mkdir -p "$ENV39/.ccs/instances/work/projects/p"
+make_identified_line "$TODAY" 50 0 0 0 work same same \
+    > "$ENV39/.ccs/instances/work/projects/p/test.jsonl"
+OUTPUT39=$(run_script "$ENV39")
+assert_eq "$(usage_field "$OUTPUT39" WEEK_TOKENS)" "150" "each field uses its maximum and separate profiles do not deduplicate each other"
+assert_eq "$(usage_field "$OUTPUT39" WEEK_MESSAGES)" "2" "one deduplicated message per profile"
+assert_match "$(usage_field "$OUTPUT39" PROFILE_WEEK_TOKENS)" "default:100,work:50" "profile totals stay independent"
 
 # ============================================================
 echo ""

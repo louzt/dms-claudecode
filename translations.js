@@ -92,6 +92,14 @@ var strings = {
         { fr: "Supprimer", es: "Eliminar" },
     "No items added yet":
         { fr: "Aucun élément ajouté pour le moment", es: "Todavía no se ha añadido ningún elemento" },
+    "No Claude Code CLI login found. Run `claude /login` to see rate limits.":
+        { fr: "Aucune connexion Claude Code CLI trouvée. Exécutez `claude /login` pour voir les limites d'utilisation.", es: "No se encontró ningún inicio de sesión de Claude Code CLI. Ejecuta `claude /login` para ver los límites de uso." },
+    "Claude Code login expired. Run `claude` to refresh it.":
+        { fr: "La connexion à Claude Code a expiré. Exécutez `claude` pour la renouveler.", es: "El inicio de sesión de Claude Code ha caducado. Ejecuta `claude` para renovarlo." },
+    "The usage API is rate limiting requests. Showing the last known values.":
+        { fr: "L'API d'utilisation limite les requêtes. Dernières valeurs connues affichées.", es: "La API de uso está limitando las solicitudes. Se muestran los últimos valores conocidos." },
+    "Could not reach the usage API. Showing the last known values.":
+        { fr: "Impossible de joindre l'API d'utilisation. Dernières valeurs connues affichées.", es: "No se pudo contactar con la API de uso. Se muestran los últimos valores conocidos." },
 }
 
 function tr(key, lang) {

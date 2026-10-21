@@ -87,6 +87,21 @@ The plugin runs a lightweight bash script at the configured interval that:
 
 API usage responses are cached for 2 minutes (`~/.claude/usage-cache.json`) to avoid rate limiting, with stale fallback on errors.
 
+### Sign-in status
+
+Rate limits (the 5-hour and 7-day windows) come from the Anthropic API using the OAuth token in `<config dir>/.credentials.json`, which is the Claude Code **CLI** login. The plugin only reads that file. It never writes or refreshes it, so the token is renewed whenever the CLI runs.
+
+When that data can't be trusted, the popout shows a notice above the rate windows, dims the rings and the taskbar pill, and hides the pacing and countdown. The last known values are still shown, marked as old:
+
+| Notice | Meaning |
+|--------|---------|
+| No Claude Code CLI login found | The profile has no `.credentials.json`. Run `claude /login`. |
+| Claude Code login expired | The API rejected the token, or it is past its expiry. Run `claude` once to refresh it. |
+| The usage API is rate limiting requests | The API answered HTTP 429. It recovers on its own. |
+| Could not reach the usage API | Network error or an unexpected response. |
+
+Token, cost and model statistics are read from the local session logs and keep working in every case. If you only use the Claude desktop app and never the CLI, there is no CLI login, so the rate-limit windows show the "No Claude Code CLI login found" notice until you sign in once with `claude /login`.
+
 All data stays local. Network requests are limited to the official Anthropic API (usage), GitHub (LiteLLM pricing, once/day), and Frankfurter (exchange rate, once/day).
 
 ## License

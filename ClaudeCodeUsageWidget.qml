@@ -39,6 +39,8 @@ PluginComponent {
     property real sevenDayUtil: 0
     property string sevenDayReset: ""
     property bool extraUsageEnabled: false
+    // ok | missing | expired | rate_limited | stale ("" until the first script run)
+    property string authState: ""
 
     // Weekly state
     property int weekMessages: 0
@@ -101,6 +103,11 @@ PluginComponent {
     property string displayFiveHourReset: currentPd && currentPd.fiveHourReset !== undefined ? currentPd.fiveHourReset : fiveHourReset
     property real displaySevenDayUtil: currentPd && currentPd.sevenDayUtil !== undefined ? currentPd.sevenDayUtil : sevenDayUtil
     property string displaySevenDayReset: currentPd && currentPd.sevenDayReset !== undefined ? currentPd.sevenDayReset : sevenDayReset
+    property string displayAuthState: currentPd && currentPd.authState !== undefined ? currentPd.authState : authState
+    // "" (not yet known) counts as fine so nothing flashes before the first run
+    readonly property bool authOk: authState === "" || authState === "ok"
+    readonly property bool displayAuthOk: displayAuthState === "" || displayAuthState === "ok"
+    readonly property string displayAuthNotice: authNotice(displayAuthState)
     property real displayWeekTokens: currentPd && currentPd.weekTokens !== undefined ? currentPd.weekTokens : weekTokens
     property int displayWeekMessages: currentPd && currentPd.weekMessages !== undefined ? currentPd.weekMessages : weekMessages
     property int displayWeekSessions: currentPd && currentPd.weekSessions !== undefined ? currentPd.weekSessions : weekSessions
@@ -118,7 +125,7 @@ PluginComponent {
     // The Token Consumption card uses displayTodayCost/displayWeekCost/displayMonthCost instead.
 
     property string displayFiveHourCountdown: {
-        if (!displayFiveHourReset)
+        if (!displayFiveHourReset || !displayAuthOk)
             return "";
         var resetMs = new Date(displayFiveHourReset).getTime();
         var remaining = Math.max(0, resetMs - countdownNow);
@@ -130,7 +137,7 @@ PluginComponent {
     }
 
     property string displaySevenDayCountdown: {
-        if (!displaySevenDayReset)
+        if (!displaySevenDayReset || !displayAuthOk)
             return "";
         var resetMs = new Date(displaySevenDayReset).getTime();
         var remaining = Math.max(0, resetMs - countdownNow);
@@ -144,16 +151,22 @@ PluginComponent {
         return hours + "h " + (mins < 10 ? "0" : "") + mins + "m";
     }
 
+    readonly property var unknownPace: ({
+            timeFrac: 0,
+            delta: 0,
+            status: "unknown"
+        })
+
     // Pacing: whether usage is ahead of (over) or behind (under) a linear burn
     // rate for the time window. Each touches countdownNow so it recomputes on
     // the 60s timer below.
     property var fiveHourPace: {
         void (countdownNow);
-        return paceInfo(displayFiveHourUtil, displayFiveHourReset, 18000000);
+        return displayAuthOk ? paceInfo(displayFiveHourUtil, displayFiveHourReset, 18000000) : unknownPace;
     }
     property var sevenDayPace: {
         void (countdownNow);
-        return paceInfo(displaySevenDayUtil, displaySevenDayReset, 604800000);
+        return displayAuthOk ? paceInfo(displaySevenDayUtil, displaySevenDayReset, 604800000) : unknownPace;
     }
     // Pills are not profile-scoped — derive from aggregate 5h values.
     property var pillFivePace: {
@@ -162,7 +175,7 @@ PluginComponent {
     }
     // Whether the taskbar pill should show the over-pace arrow/color. Shared by
     // the horizontal and vertical pills so they never diverge.
-    readonly property bool pillOverPace: showPacing && (pillFivePace.status === "over" || pillFivePace.status === "over_quota")
+    readonly property bool pillOverPace: showPacing && authOk && (pillFivePace.status === "over" || pillFivePace.status === "over_quota")
 
     // Today's index in the calendar week (0=Monday, 6=Sunday)
     property int todayIndex: {
@@ -335,6 +348,23 @@ PluginComponent {
         ctx.stroke();
     }
 
+    // Notice for a non-ok auth state; "" when there is nothing to report
+    // (ok, not yet known, or an unrecognised value from a newer script).
+    function authNotice(state) {
+        switch (state) {
+        case "missing":
+            return tr("No Claude Code CLI login found. Run `claude /login` to see rate limits.");
+        case "expired":
+            return tr("Claude Code login expired. Run `claude` to refresh it.");
+        case "rate_limited":
+            return tr("The usage API is rate limiting requests. Showing the last known values.");
+        case "stale":
+            return tr("Could not reach the usage API. Showing the last known values.");
+        default:
+            return "";
+        }
+    }
+
     function formatCost(usd) {
         var useEur = lang === "fr" && usdEurRate > 0;
         var n = useEur ? usd * usdEurRate : usd;
@@ -474,6 +504,9 @@ PluginComponent {
         case "EXTRA_USAGE_ENABLED":
             extraUsageEnabled = (val === "true");
             break;
+        case "AUTH_STATE":
+            authState = val;
+            break;
         case "WEEK_MESSAGES":
             weekMessages = parseInt(val) || 0;
             break;
@@ -600,6 +633,9 @@ PluginComponent {
             break;
         case "PROFILE_EXTRA_USAGE":
             profileData = parseProfileBool(val, "extraUsageEnabled");
+            break;
+        case "PROFILE_AUTH_STATE":
+            profileData = parseProfileString(val, "authState");
             break;
         case "PROFILE_DAILY":
             {
@@ -739,6 +775,7 @@ PluginComponent {
     horizontalBarPill: Component {
         Row {
             spacing: Theme.spacingXS
+            opacity: root.authOk ? 1 : 0.45
 
             Canvas {
                 id: hRing
@@ -786,6 +823,7 @@ PluginComponent {
     verticalBarPill: Component {
         Column {
             spacing: Theme.spacingXS || 4
+            opacity: root.authOk ? 1 : 0.45
 
             Canvas {
                 id: vRing
@@ -998,6 +1036,24 @@ PluginComponent {
                     }
                 }
 
+                // --- Auth notice (only when the usage numbers can't be trusted) ---
+                StyledRect {
+                    width: parent.width
+                    height: authNoticeText.implicitHeight + Theme.spacingS * 2
+                    color: Theme.surfaceContainerHigh
+                    visible: root.displayAuthNotice !== ""
+
+                    StyledText {
+                        id: authNoticeText
+                        anchors.fill: parent
+                        anchors.margins: Theme.spacingS
+                        text: root.displayAuthNotice
+                        font.pixelSize: Theme.fontSizeSmall
+                        color: Theme.warning
+                        wrapMode: Text.WordWrap
+                    }
+                }
+
                 // --- 5h Rate Window card ---
                 StyledRect {
                     width: parent.width
@@ -1006,6 +1062,7 @@ PluginComponent {
 
                     Row {
                         id: fiveHourContent
+                        opacity: root.displayAuthOk ? 1 : 0.45
                         anchors.fill: parent
                         anchors.margins: Theme.spacingS
                         spacing: Theme.spacingM
@@ -1103,6 +1160,7 @@ PluginComponent {
 
                     Row {
                         id: sevenDayContent
+                        opacity: root.displayAuthOk ? 1 : 0.45
                         anchors.fill: parent
                         anchors.margins: Theme.spacingM
                         spacing: Theme.spacingM
