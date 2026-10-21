@@ -739,7 +739,7 @@ assert_eq "$(usage_field "$OUTPUT28" WEEK_MESSAGES)" "1" "one message despite st
 assert_eq "$(usage_field "$OUTPUT28" WEEK_SESSIONS)" "1" "zeroed resume does not add a billed session"
 assert_match "$(usage_field "$OUTPUT28" WEEK_MODELS)" "opus=24014" "model totals use deduplicated tokens"
 assert_eq "$(usage_field "$OUTPUT28" TODAY_COST)" "0.21" "cost uses deduplicated counters"
-assert_eq "$(echo "$(usage_field "$OUTPUT28" DAILY)" | cut -d, -f$((TODAY_IDX + 1)))" "24014" "daily activity uses deduplicated tokens"
+assert_eq "$(usage_field "$OUTPUT28" DAILY | cut -d, -f$((TODAY_IDX + 1)))" "24014" "daily activity uses deduplicated tokens"
 
 # Reverse row order: maxima must not depend on traversal or stream order.
 { make_identified_line "$TODAY" 0 0 0 0 resumed msg-stream req-stream
