@@ -15,12 +15,18 @@ FAIL=0
 pass() { PASS=$((PASS + 1)); echo "  PASS: $1"; }
 fail() { FAIL=$((FAIL + 1)); echo "  FAIL: $1" >&2; }
 
+assert_json() {
+    if [ "$1" = "$2" ]; then pass "$3"; else fail "$3 (expected '$2', got '$1')"; fi
+}
+
 # Run a JS expression and capture stdout
 run_js() {
     node -e "$1" 2>/dev/null
 }
 
-# Build JS test harness with functions extracted from the QML widget
+# Build JS test harness with functions extracted from the QML widget.
+# The JS contains backticks (the notice strings mirror the widget), which are literal here.
+# shellcheck disable=SC2016
 JS_HARNESS='
 // --- Functions extracted from ClaudeCodeUsageWidget.qml ---
 
@@ -46,7 +52,8 @@ var testLang = "en"
 var tierTranslations = {
     Free: { fr: "Gratuit", es: "Gratis" },
     Team: { fr: "Équipe", es: "Equipo" },
-    Enterprise: { fr: "Entreprise", es: "Empresa" }
+    Enterprise: { fr: "Entreprise", es: "Empresa" },
+    "Claude Code login expired. Run `claude` to refresh it.": { fr: "FR-EXPIRED", es: "ES-EXPIRED" }
 }
 
 function tr(key) {
@@ -67,6 +74,42 @@ function formatTier(tier) {
     return tier.replace(/_/g, " ").replace(/\b\w/g, function (c) {
         return c.toUpperCase()
     })
+}
+
+function authNotice(state) {
+    switch (state) {
+    case "missing":
+        return tr("No Claude Code CLI login found. Run `claude /login` to see rate limits.")
+    case "expired":
+        return tr("Claude Code login expired. Run `claude` to refresh it.")
+    case "rate_limited":
+        return tr("The usage API is rate limiting requests. Showing the last known values.")
+    case "stale":
+        return tr("Could not reach the usage API. Showing the last known values.")
+    default:
+        return ""
+    }
+}
+
+// parseProfileString: profileData passed in/out instead of read from the QML property
+function parseProfileString(profileData, val, field) {
+    var _pd = Object.assign({}, profileData)
+    var entries = val.split(",")
+    for (var i = 0; i < entries.length; i++) {
+        var entry = entries[i]
+        var colon = entry.indexOf(":")
+        if (colon < 0) continue
+        var name = entry.substring(0, colon)
+        if (!_pd[name]) _pd[name] = {}
+        else _pd[name] = Object.assign({}, _pd[name])
+        _pd[name][field] = entry.substring(colon + 1)
+    }
+    return _pd
+}
+
+// displayAuthState: per-profile state wins, otherwise the aggregate (default profile)
+function displayAuthState(currentPd, authState) {
+    return currentPd && currentPd.authState !== undefined ? currentPd.authState : authState
 }
 
 function formatCost(usd, lang, usdEurRate) {
@@ -100,6 +143,7 @@ function parseLine(line, state) {
     case "SEVEN_DAY_UTIL": state.sevenDayUtil = parseFloat(val) || 0; break
     case "SEVEN_DAY_RESET": state.sevenDayReset = val; break
     case "EXTRA_USAGE_ENABLED": state.extraUsageEnabled = (val === "true"); break
+    case "AUTH_STATE": state.authState = val; break
     case "WEEK_MESSAGES": state.weekMessages = parseInt(val) || 0; break
     case "WEEK_SESSIONS": state.weekSessions = parseInt(val) || 0; break
     case "WEEK_TOKENS": state.weekTokens = parseFloat(val) || 0; break
@@ -424,6 +468,71 @@ if [ "$RESULT_MODELS_BAD" = '[{"modelName":"opus","modelTokens":5000},{"modelNam
 else
     fail "parseLine WEEK_MODELS malformed expected opus+sonnet only, got $RESULT_MODELS_BAD"
 fi
+
+
+# ============================================================
+echo "=== Test 8: auth state ==="
+# ============================================================
+
+test_parse_line "AUTH_STATE=expired" "authState" '"expired"' "parseLine AUTH_STATE"
+test_parse_line "AUTH_STATE=" "authState" '""' "parseLine empty AUTH_STATE is empty string"
+
+# authNotice: empty for ok / unknown / empty, distinct message for each failing state
+for state in ok "" nonsense; do
+    result=$(run_js "${JS_HARNESS} console.log(JSON.stringify(authNotice('$state')))")
+    assert_json "$result" '""' "authNotice('$state') is empty"
+done
+
+NOTICES=""
+for state in missing expired rate_limited stale; do
+    msg=$(run_js "${JS_HARNESS} console.log(authNotice('$state'))")
+    if [ -z "$msg" ]; then
+        fail "authNotice('$state') should not be empty"
+    else
+        pass "authNotice('$state') has a message"
+    fi
+    NOTICES="$NOTICES$msg"$'\n'
+done
+DISTINCT=$(printf '%s' "$NOTICES" | sort -u | grep -c .)
+if [ "$DISTINCT" = "4" ]; then
+    pass "authNotice messages are distinct for the four failing states"
+else
+    fail "authNotice messages should be 4 distinct strings, got $DISTINCT"
+fi
+
+result=$(run_js "${JS_HARNESS} testLang='fr'; console.log(authNotice('expired'))")
+if [ "$result" = "FR-EXPIRED" ]; then
+    pass "authNotice goes through tr()"
+else
+    fail "authNotice should be translated (got '$result')"
+fi
+
+# parseProfileString for PROFILE_AUTH_STATE
+result=$(run_js "${JS_HARNESS}
+    var pd = parseProfileString({}, 'default:ok,work:missing', 'authState');
+    console.log(JSON.stringify([pd.default.authState, pd.work.authState]));
+")
+assert_json "$result" '["ok","missing"]' "PROFILE_AUTH_STATE parses name:state pairs"
+
+result=$(run_js "${JS_HARNESS}
+    var pd = parseProfileString({}, '', 'authState');
+    console.log(JSON.stringify(pd));
+")
+assert_json "$result" '{}' "PROFILE_AUTH_STATE empty value adds no profiles"
+
+result=$(run_js "${JS_HARNESS}
+    var pd = parseProfileString({a: {weekTokens: 5}}, 'a:stale,garbage', 'authState');
+    console.log(JSON.stringify(pd));
+")
+assert_json "$result" '{"a":{"weekTokens":5,"authState":"stale"}}' "PROFILE_AUTH_STATE keeps other fields, skips entries without a colon"
+
+# displayAuthState: selected profile wins; "all" (null) falls back to the aggregate
+result=$(run_js "${JS_HARNESS} console.log(displayAuthState(null, 'ok'))")
+assert_json "$result" 'ok' "displayAuthState uses aggregate when no profile selected"
+result=$(run_js "${JS_HARNESS} console.log(displayAuthState({authState: 'missing'}, 'ok'))")
+assert_json "$result" 'missing' "displayAuthState prefers the selected profile's state"
+result=$(run_js "${JS_HARNESS} console.log(displayAuthState({weekTokens: 1}, 'expired'))")
+assert_json "$result" 'expired' "displayAuthState falls back when the profile has no state"
 
 # ============================================================
 echo ""

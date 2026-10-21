@@ -27,11 +27,23 @@ setup_env() {
     echo "$dir"
 }
 
-# Mock curl: always returns empty JSON (avoids real network calls)
+# Mock curl: returns empty JSON for everything except the usage endpoint
+# (avoids real network calls). The usage endpoint honours:
+#   MOCK_USAGE_BODY  response body            (default '{}')
+#   MOCK_USAGE_CODE  HTTP status printed by -w (default 200)
+#   MOCK_USAGE_FAIL  non-empty: exit 6 with no output, like a network failure
+#   MOCK_CURL_LOG    file that gets one line per usage request
 mock_curl="$TMPDIR_ROOT/curl"
 cat > "$mock_curl" << 'CURLEOF'
 #!/usr/bin/env bash
-echo '{}'
+case "$*" in
+    *api/oauth/usage*)
+        [ -n "${MOCK_CURL_LOG:-}" ] && echo "usage" >> "$MOCK_CURL_LOG"
+        [ -n "${MOCK_USAGE_FAIL:-}" ] && exit 6
+        printf '%s\n%s' "${MOCK_USAGE_BODY:-{\}}" "${MOCK_USAGE_CODE:-200}"
+        ;;
+    *) echo '{}' ;;
+esac
 CURLEOF
 chmod +x "$mock_curl"
 
@@ -51,12 +63,12 @@ make_jsonl_line() {
 }
 
 # ============================================================
-echo "=== Test 1: Output format — all 21 keys present ==="
+echo "=== Test 1: Output format — all 22 keys present ==="
 # ============================================================
 ENV1=$(setup_env "test1")
 OUTPUT1=$(run_script "$ENV1")
 
-EXPECTED_KEYS="SUBSCRIPTION_TYPE RATE_LIMIT_TIER FIVE_HOUR_UTIL FIVE_HOUR_RESET SEVEN_DAY_UTIL SEVEN_DAY_RESET EXTRA_USAGE_ENABLED WEEK_MESSAGES WEEK_SESSIONS WEEK_TOKENS WEEK_MODELS ALLTIME_SESSIONS ALLTIME_MESSAGES FIRST_SESSION DAILY MONTH_TOKENS TODAY_COST WEEK_COST MONTH_COST DAILY_COSTS USD_EUR_RATE"
+EXPECTED_KEYS="SUBSCRIPTION_TYPE RATE_LIMIT_TIER FIVE_HOUR_UTIL FIVE_HOUR_RESET SEVEN_DAY_UTIL SEVEN_DAY_RESET EXTRA_USAGE_ENABLED AUTH_STATE WEEK_MESSAGES WEEK_SESSIONS WEEK_TOKENS WEEK_MODELS ALLTIME_SESSIONS ALLTIME_MESSAGES FIRST_SESSION DAILY MONTH_TOKENS TODAY_COST WEEK_COST MONTH_COST DAILY_COSTS USD_EUR_RATE"
 for key in $EXPECTED_KEYS; do
     if echo "$OUTPUT1" | grep -q "^${key}="; then
         pass "key $key present"
@@ -714,6 +726,126 @@ if echo "$PROFILES27C" | tr ',' '\n' | grep -q '^alias$'; then
 else
     pass "duplicate config directory registered only once"
 fi
+
+
+# ============================================================
+echo "=== Test 28: AUTH_STATE — live response is ok ==="
+# ============================================================
+VALID_BODY='{"five_hour":{"utilization":55,"resets_at":"2099-01-01T00:00:00Z"},"seven_day":{"utilization":20,"resets_at":"2099-01-07T00:00:00Z"},"extra_usage":{"is_enabled":false}}'
+make_creds() {
+    # make_creds <env> [expiresAt-ms] [accessToken]
+    local env="$1" exp="${2:-4102444800000}" tok="${3-fake-token}"
+    cat > "$env/.claude/.credentials.json" << CREDEOF
+{"claudeAiOauth":{"subscriptionType":"pro","rateLimitTier":"t1_pro","accessToken":"$tok","expiresAt":$exp}}
+CREDEOF
+}
+auth_state_of() { echo "$1" | grep "^AUTH_STATE=" | cut -d= -f2; }
+
+ENV28=$(setup_env "test28")
+make_creds "$ENV28"
+OUTPUT28=$(MOCK_USAGE_BODY="$VALID_BODY" run_script "$ENV28")
+assert_eq "$(auth_state_of "$OUTPUT28")" "ok" "live response: AUTH_STATE=ok"
+assert_eq "$(echo "$OUTPUT28" | grep "^FIVE_HOUR_UTIL=" | cut -d= -f2)" "55" "live response: usage still parsed"
+assert_match "$OUTPUT28" "^PROFILE_AUTH_STATE=default:ok$" "live response: PROFILE_AUTH_STATE lists default:ok"
+
+# ============================================================
+echo "=== Test 29: AUTH_STATE — missing credentials ==="
+# ============================================================
+ENV29=$(setup_env "test29")
+OUTPUT29=$(run_script "$ENV29")
+assert_eq "$(auth_state_of "$OUTPUT29")" "missing" "no credentials file: AUTH_STATE=missing"
+
+ENV29B=$(setup_env "test29b")
+make_creds "$ENV29B" 4102444800000 ""
+OUTPUT29B=$(run_script "$ENV29B")
+assert_eq "$(auth_state_of "$OUTPUT29B")" "missing" "empty accessToken: AUTH_STATE=missing"
+
+# ============================================================
+echo "=== Test 30: AUTH_STATE — expired ==="
+# ============================================================
+ENV30=$(setup_env "test30")
+make_creds "$ENV30"
+for code in 401 403; do
+    OUTPUT30=$(MOCK_USAGE_CODE="$code" run_script "$ENV30")
+    assert_eq "$(auth_state_of "$OUTPUT30")" "expired" "HTTP $code: AUTH_STATE=expired"
+done
+
+ENV30B=$(setup_env "test30b")
+make_creds "$ENV30B" 1000
+OUTPUT30B=$(MOCK_USAGE_FAIL=1 run_script "$ENV30B")
+assert_eq "$(auth_state_of "$OUTPUT30B")" "expired" "expiresAt in the past + failed call: AUTH_STATE=expired"
+
+# ============================================================
+echo "=== Test 31: AUTH_STATE — rate limited ==="
+# ============================================================
+ENV31=$(setup_env "test31")
+make_creds "$ENV31"
+OUTPUT31=$(MOCK_USAGE_CODE=429 run_script "$ENV31")
+assert_eq "$(auth_state_of "$OUTPUT31")" "rate_limited" "HTTP 429: AUTH_STATE=rate_limited"
+
+ENV31B=$(setup_env "test31b")
+make_creds "$ENV31B" 1000
+OUTPUT31B=$(MOCK_USAGE_CODE=429 run_script "$ENV31B")
+assert_eq "$(auth_state_of "$OUTPUT31B")" "rate_limited" "HTTP 429 wins over a past expiresAt"
+
+# ============================================================
+echo "=== Test 32: AUTH_STATE — stale keeps cached values ==="
+# ============================================================
+ENV32=$(setup_env "test32")
+make_creds "$ENV32"
+OLD_TS=$(( $(date +%s) - 3600 ))
+cat > "$ENV32/.claude/usage-cache.json" << CACHEEOF
+{"cached_at": $OLD_TS, "identity": "$ENV32/.claude/.credentials.json", "data": $VALID_BODY}
+CACHEEOF
+OUTPUT32=$(MOCK_USAGE_CODE=500 run_script "$ENV32")
+assert_eq "$(auth_state_of "$OUTPUT32")" "stale" "HTTP 500 with cache: AUTH_STATE=stale"
+assert_eq "$(echo "$OUTPUT32" | grep "^FIVE_HOUR_UTIL=" | cut -d= -f2)" "55" "stale: cached FIVE_HOUR_UTIL still emitted"
+
+OUTPUT32B=$(MOCK_USAGE_FAIL=1 run_script "$ENV32")
+assert_eq "$(auth_state_of "$OUTPUT32B")" "stale" "network failure: AUTH_STATE=stale"
+
+# A cache that belongs to another profile must not be used as the fallback
+sed -i "s|$ENV32/.claude/.credentials.json|$ENV32/other/.credentials.json|" "$ENV32/.claude/usage-cache.json"
+OUTPUT32C=$(MOCK_USAGE_CODE=500 run_script "$ENV32")
+assert_eq "$(echo "$OUTPUT32C" | grep "^FIVE_HOUR_UTIL=" | cut -d= -f2)" "0" "stale: foreign cache not used as fallback"
+
+# ============================================================
+echo "=== Test 33: AUTH_STATE — fresh cache makes no request and is ok ==="
+# ============================================================
+ENV33=$(setup_env "test33")
+make_creds "$ENV33" 1000
+cat > "$ENV33/.claude/usage-cache.json" << CACHEEOF
+{"cached_at": $(date +%s), "identity": "$ENV33/.claude/.credentials.json", "data": $VALID_BODY}
+CACHEEOF
+CURL_LOG33="$TMPDIR_ROOT/curl33.log"
+: > "$CURL_LOG33"
+OUTPUT33=$(MOCK_CURL_LOG="$CURL_LOG33" MOCK_USAGE_CODE=401 run_script "$ENV33")
+assert_eq "$(auth_state_of "$OUTPUT33")" "ok" "fresh cache: AUTH_STATE=ok"
+assert_eq "$(wc -l < "$CURL_LOG33")" "0" "fresh cache: no usage request made"
+
+# ============================================================
+echo "=== Test 34: PROFILE_AUTH_STATE — per profile, default drives AUTH_STATE ==="
+# ============================================================
+ENV34=$(setup_env "test34")
+make_creds "$ENV34"
+mkdir -p "$ENV34/.ccs/instances/work/projects/proj1"
+OUTPUT34=$(MOCK_USAGE_BODY="$VALID_BODY" run_script "$ENV34")
+assert_match "$OUTPUT34" "^PROFILE_AUTH_STATE=default:ok,work:missing$" "per-profile states: default ok, work missing"
+assert_eq "$(auth_state_of "$OUTPUT34")" "ok" "AUTH_STATE mirrors the default profile"
+
+# ============================================================
+echo "=== Test 35: the access token never appears in output ==="
+# ============================================================
+ENV35=$(setup_env "test35")
+make_creds "$ENV35" 4102444800000 "SECRET-TOKEN-VALUE"
+for code in 200 401 429 500; do
+    OUTPUT35=$(MOCK_USAGE_CODE="$code" run_script "$ENV35")
+    if echo "$OUTPUT35" | grep -q "SECRET-TOKEN-VALUE"; then
+        fail "token leaked in output (HTTP $code)"
+    else
+        pass "token absent from output (HTTP $code)"
+    fi
+done
 
 # ============================================================
 echo ""

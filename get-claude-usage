@@ -27,6 +27,7 @@ FIVE_HOUR_RESET=""
 SEVEN_DAY_UTIL=0
 SEVEN_DAY_RESET=""
 EXTRA_USAGE_ENABLED="false"
+AUTH_STATE="missing"
 
 WEEK_TOKENS=0
 WEEK_MESSAGES=0
@@ -229,7 +230,13 @@ count_profile_tokens() {
 # --- Per-profile credentials + API usage fetcher ---
 # Usage: fetch_profile_usage <credentials_file> <cache_file> <out_tmpfile>
 # Writes SUBSCRIPTION_TYPE, RATE_LIMIT_TIER, FIVE_HOUR_UTIL, FIVE_HOUR_RESET,
-#        SEVEN_DAY_UTIL, SEVEN_DAY_RESET, EXTRA_USAGE_ENABLED to out_tmpfile
+#        SEVEN_DAY_UTIL, SEVEN_DAY_RESET, EXTRA_USAGE_ENABLED, AUTH_STATE to out_tmpfile
+# AUTH_STATE: ok | missing | expired | rate_limited | stale
+#   ok            live (or fresh-cache) response
+#   missing       no credentials file / no access token
+#   expired       API answered 401/403, or the token is past expiresAt and no live response
+#   rate_limited  API answered 429
+#   stale         any other failure; cached values (if any) are emitted
 fetch_profile_usage() {
     local creds_file="$1"
     local cache_file="$2"
@@ -238,10 +245,11 @@ fetch_profile_usage() {
     local sub_type="unknown"
     local tier="unknown"
     local five_util=0 five_reset="" seven_util=0 seven_reset="" extra="false"
+    local auth_state="missing"
 
     if [ ! -f "$creds_file" ]; then
-        printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\n' \
-            "$sub_type" "$tier" "$five_util" "$five_reset" "$seven_util" "$seven_reset" "$extra" > "$out_file"
+        printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\nAUTH_STATE=%s\n' \
+            "$sub_type" "$tier" "$five_util" "$five_reset" "$seven_util" "$seven_reset" "$extra" "$auth_state" > "$out_file"
         return
     fi
 
@@ -269,19 +277,27 @@ fetch_profile_usage() {
 
     if [ "$use_cache" = true ]; then
         api_resp=$(jq -r '.data // {}' "$cache_file" 2>/dev/null || echo '{}')
+        auth_state="ok"
     else
         local token
         token=$(jq -r '.claudeAiOauth.accessToken // ""' "$creds_file" 2>/dev/null || echo "")
         if [ -n "$token" ]; then
-            api_resp=$(curl -s --max-time 5 \
+            # -w appends the HTTP status after the body on its own line, so the
+            # failure can be classified; curl failing outright leaves status 000.
+            local raw http_code expires_at
+            raw=$(curl -s --max-time 5 -w '\n%{http_code}' \
                 -H "Authorization: Bearer $token" \
                 -H "Accept: application/json" \
                 -H "Content-Type: application/json" \
                 -H "User-Agent: claude-code/${CLAUDE_VERSION}" \
                 -H "anthropic-beta: oauth-2025-04-20" \
-                "https://api.anthropic.com/api/oauth/usage" 2>/dev/null || echo '{}')
+                "https://api.anthropic.com/api/oauth/usage" 2>/dev/null) || raw=$'{}\n000'
+            http_code="${raw##*$'\n'}"
+            api_resp="${raw%$'\n'*}"
+            [ -n "$api_resp" ] || api_resp='{}'
 
             if echo "$api_resp" | jq -e '.five_hour' >/dev/null 2>&1; then
+                auth_state="ok"
                 # Write atomically: overlapping widget refreshes both target the
                 # same cache file, and a plain `> "$cache_file"` interleaves their
                 # output into corrupt JSON. Write to a per-PID temp then rename.
@@ -292,8 +308,23 @@ fetch_profile_usage() {
                 else
                     rm -f "$cache_tmp"
                 fi
-            elif [ "$cache_matches" = true ]; then
-                api_resp=$(jq -r '.data // {}' "$cache_file" 2>/dev/null || echo '{}')
+            else
+                expires_at=$(jq -r '.claudeAiOauth.expiresAt // 0' "$creds_file" 2>/dev/null | head -1)
+                [[ "$expires_at" =~ ^[0-9]+$ ]] || expires_at=0
+                if [ "$http_code" = "429" ]; then
+                    auth_state="rate_limited"
+                elif [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
+                    auth_state="expired"
+                elif [ "$expires_at" -gt 0 ] && [ "$expires_at" -lt $(( $(date +%s) * 1000 )) ]; then
+                    auth_state="expired"
+                else
+                    auth_state="stale"
+                fi
+                if [ "$cache_matches" = true ]; then
+                    api_resp=$(jq -r '.data // {}' "$cache_file" 2>/dev/null || echo '{}')
+                else
+                    api_resp='{}'
+                fi
             fi
         fi
     fi
@@ -304,8 +335,8 @@ fetch_profile_usage() {
     seven_reset=$(echo "$api_resp" | jq -r '.seven_day.resets_at // ""')
     extra=$(echo "$api_resp" | jq -r '.extra_usage.is_enabled // false')
 
-    printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\n' \
-        "$sub_type" "$tier" "$five_util" "$five_reset" "$seven_util" "$seven_reset" "$extra" > "$out_file"
+    printf 'SUBSCRIPTION_TYPE=%s\nRATE_LIMIT_TIER=%s\nFIVE_HOUR_UTIL=%s\nFIVE_HOUR_RESET=%s\nSEVEN_DAY_UTIL=%s\nSEVEN_DAY_RESET=%s\nEXTRA_USAGE_ENABLED=%s\nAUTH_STATE=%s\n' \
+        "$sub_type" "$tier" "$five_util" "$five_reset" "$seven_util" "$seven_reset" "$extra" "$auth_state" > "$out_file"
 }
 
 # --- Collect profile list ---
@@ -433,6 +464,7 @@ PROF_SEVEN_DAY_UTIL=""
 PROF_FIVE_HOUR_RESET_LIST=""
 PROF_SEVEN_DAY_RESET_LIST=""
 PROF_EXTRA_USAGE_LIST=""
+PROF_AUTH_STATE_LIST=""
 
 for idx in "${!TMPFILES[@]}"; do
     tmpf="${TMPFILES[$idx]}"
@@ -454,7 +486,7 @@ for idx in "${!TMPFILES[@]}"; do
 
     # Read per-profile usage/subscription
     p_sub="unknown"; p_tier="unknown"
-    p_5u=0; p_5r=""; p_7u=0; p_7r=""; p_extra="false"
+    p_5u=0; p_5r=""; p_7u=0; p_7r=""; p_extra="false"; p_auth="missing"
     if [ -f "$usage_tmpf" ]; then
         p_sub=$(grep "^SUBSCRIPTION_TYPE=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "unknown")
         p_tier=$(grep "^RATE_LIMIT_TIER=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "unknown")
@@ -463,6 +495,7 @@ for idx in "${!TMPFILES[@]}"; do
         p_7u=$(grep "^SEVEN_DAY_UTIL=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo 0)
         p_7r=$(grep "^SEVEN_DAY_RESET=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "")
         p_extra=$(grep "^EXTRA_USAGE_ENABLED=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "false")
+        p_auth=$(grep "^AUTH_STATE=" "$usage_tmpf" 2>/dev/null | cut -d= -f2- || echo "missing")
     fi
 
     # Default profile drives the top-level aggregate fields
@@ -474,6 +507,7 @@ for idx in "${!TMPFILES[@]}"; do
         SEVEN_DAY_UTIL="$p_7u"
         SEVEN_DAY_RESET="$p_7r"
         EXTRA_USAGE_ENABLED="$p_extra"
+        AUTH_STATE="$p_auth"
     fi
 
     # Aggregate token totals
@@ -521,6 +555,7 @@ for idx in "${!TMPFILES[@]}"; do
     PROF_FIVE_HOUR_RESET_LIST="${PROF_FIVE_HOUR_RESET_LIST:+${PROF_FIVE_HOUR_RESET_LIST},}${pname}:${p_5r}"
     PROF_SEVEN_DAY_RESET_LIST="${PROF_SEVEN_DAY_RESET_LIST:+${PROF_SEVEN_DAY_RESET_LIST},}${pname}:${p_7r}"
     PROF_EXTRA_USAGE_LIST="${PROF_EXTRA_USAGE_LIST:+${PROF_EXTRA_USAGE_LIST},}${pname}:${p_extra}"
+    PROF_AUTH_STATE_LIST="${PROF_AUTH_STATE_LIST:+${PROF_AUTH_STATE_LIST},}${pname}:${p_auth}"
 
     rm -f "$tmpf" "$usage_tmpf"
 done
@@ -548,6 +583,7 @@ echo "FIVE_HOUR_RESET=${FIVE_HOUR_RESET}"
 echo "SEVEN_DAY_UTIL=${SEVEN_DAY_UTIL}"
 echo "SEVEN_DAY_RESET=${SEVEN_DAY_RESET}"
 echo "EXTRA_USAGE_ENABLED=${EXTRA_USAGE_ENABLED}"
+echo "AUTH_STATE=${AUTH_STATE}"
 echo "WEEK_MESSAGES=${WEEK_MESSAGES}"
 echo "WEEK_SESSIONS=${WEEK_SESSIONS}"
 echo "WEEK_TOKENS=${WEEK_TOKENS}"
@@ -580,3 +616,4 @@ echo "PROFILE_SEVEN_DAY_UTIL=${PROF_SEVEN_DAY_UTIL}"
 echo "PROFILE_FIVE_HOUR_RESET=${PROF_FIVE_HOUR_RESET_LIST}"
 echo "PROFILE_SEVEN_DAY_RESET=${PROF_SEVEN_DAY_RESET_LIST}"
 echo "PROFILE_EXTRA_USAGE=${PROF_EXTRA_USAGE_LIST}"
+echo "PROFILE_AUTH_STATE=${PROF_AUTH_STATE_LIST}"
