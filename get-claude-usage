@@ -138,7 +138,9 @@ count_profile_tokens() {
         day_dates="${day_dates:+${day_dates},}${d}"
     done
 
-    find "$proj_dir" -name "*.jsonl" -mtime -31 -exec cat {} + 2>/dev/null \
+    # Scan originals too: a recent resumed transcript can contain copies of
+    # messages from an old file. File mtimes cannot bound billing dates.
+    find "$proj_dir" -name "*.jsonl" -exec cat {} + 2>/dev/null \
         | jq -r -R 'fromjson? | select(.type == "assistant")
             # Bucket by LOCAL calendar date, not UTC. Timestamps are ISO-8601 UTC
             # (e.g. 2026-06-30T00:10:33Z); convert to the local date so the daily
@@ -147,7 +149,35 @@ count_profile_tokens() {
             # fails or jq lacks strflocaltime (see JQ_DATE_EXPR probe above).
             | (.timestamp // "") as $ts
             | ('"$JQ_DATE_EXPR"') as $d
-            | "\($d) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown")"' \
+            # Incomplete identities must remain independent records.
+            | (if ((.message.id | type) == "string" and (.message.id | length) > 0
+                   and (.requestId | type) == "string" and (.requestId | length) > 0)
+               then ([.message.id, .requestId] | tojson | @base64)
+               else "-" end) as $key
+            | "\($d) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown") \($key)"' \
+        | awk '
+        {
+            key = ($8 == "-") ? "row:" NR : "message:" $8
+            nonzero = ($3 + $4 + $5 + $6 > 0)
+            # Streams repeat input/cache counters and increase output. Resumed
+            # transcripts can copy the same message with all counters zeroed.
+            # Keep maxima across files and the earliest date with real usage.
+            # Store one compact record per identity to limit scan memory.
+            if (key in records) {
+                split(records[key], previous, " ")
+                billed = (previous[3] + previous[4] + previous[5] + previous[6] > 0)
+                if (!nonzero || (billed && previous[1] <= $1)) {
+                    $1 = previous[1]; $2 = previous[2]; $7 = previous[7]
+                }
+                for (i = 3; i <= 6; i++)
+                    if (previous[i] + 0 > $i + 0) $i = previous[i]
+            }
+            records[key] = sprintf("%s %s %.0f %.0f %.0f %.0f %s",
+                $1, $2, $3, $4, $5, $6, $7)
+        }
+        END {
+            for (key in records) print records[key]
+        }' \
         | awk -v week_start="$WEEK_START" -v month_start="$MONTH_START" -v today="$TODAY" -v day_dates="$day_dates" -v pricing="$PRICING_AWK" '
         BEGIN {
             split(day_dates, dates, ",")
