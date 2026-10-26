@@ -11,7 +11,43 @@ USAGE_CACHE="${CLAUDE_DIR}/usage-cache.json"
 USAGE_CACHE_TTL=90  # seconds, below the 2 min minimum refresh interval
 LITELLM_URL="https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
-CLAUDE_VERSION=$(claude --version 2>/dev/null | head -1 | grep -oP '[\d.]+' || echo "2.0.0")
+# 2026-10-26 (LZT): cache del conteo de tokens.
+#
+# POR QUE: count_profile_tokens hace
+#   find ~/.claude/projects -name '*.jsonl' -mtime -31 -exec cat {} + | jq ...
+# que en esta maquina son 710 ficheros / 2481 MB, y jq tiene que parsear los
+# 2.5 GB de JSON linea a linea. Medido: >1.1 GB leidos por el `cat` y 302k
+# syscalls de lectura del `jq` en una ventana de 10 s. Ese scan se ejecutaba
+# en CADA invocacion del script, y el widget de DMS lo re-lanzaba ~10 veces
+# por segundo (ver el parche del QML: el binding `customProfiles` generaba
+# una senal `changed` espuria en cada tick).
+#
+# QUE HACE: el resultado del scan se cachea por perfil con un TTL. El scan
+# real solo corre cuando el TTL expira. Un desfase de hasta
+# LZT_CCU_TOKEN_CACHE_TTL segundos en los contadores de tokens es invisible
+# (el widget refresca cada 2 min de todos modos, asi que el TTL de 300 s
+# solo evita 4 de cada 5 scans).
+#
+# INVALIDACION: el STAMP lleva los limites de calendario (semana/mes/dia).
+# Si cambian, el cache no se usa: las arrays DAILY / DAILY_COSTS tienen que
+# rotar aunque los datos underlying no hayan cambiado.
+TOKEN_CACHE_DIR="${CLAUDE_DIR}/.cache/claude-code-usage"
+TOKEN_CACHE_TTL="${LZT_CCU_TOKEN_CACHE_TTL:-300}"
+mkdir -p "$TOKEN_CACHE_DIR" 2>/dev/null || true
+
+# 2026-10-26 (LZT): `claude --version` arranca el CLI de Claude (Node) y
+# cuesta ~1-2 s. Se cachea 1 dia: solo se usa para el User-Agent de la
+# llamada a la API de usage, que no cambia entre ejecuciones.
+CLAUDE_VERSION_CACHE="${CLAUDE_DIR}/.cache/claude-code-usage/claude-version"
+if [[ -r "$CLAUDE_VERSION_CACHE" ]] && \
+   [[ "$(date +%Y-%m-%d)" == "$(head -1 "$CLAUDE_VERSION_CACHE" 2>/dev/null)" ]]; then
+    CLAUDE_VERSION=$(sed -n '2p' "$CLAUDE_VERSION_CACHE" 2>/dev/null || echo "2.0.0")
+else
+    CLAUDE_VERSION=$(claude --version 2>/dev/null | head -1 | grep -oP '[\d.]+' || echo "2.0.0")
+    { date +%Y-%m-%d; echo "$CLAUDE_VERSION"; } > "${CLAUDE_VERSION_CACHE}.$$.tmp" 2>/dev/null \
+        && mv -f "${CLAUDE_VERSION_CACHE}.$$.tmp" "$CLAUDE_VERSION_CACHE" 2>/dev/null \
+        || rm -f "${CLAUDE_VERSION_CACHE}.$$.tmp" 2>/dev/null || true
+fi
 TODAY=$(date +%Y-%m-%d)
 # Calendar week: Monday to Sunday
 DOW=$(date +%u)  # 1=Monday, 7=Sunday
@@ -122,6 +158,210 @@ else
     JQ_DATE_EXPR='(if ($ts | length) >= 10 then $ts[:10] else "1970-01-01" end)'
 fi
 
+# Extrae los records de todos los .jsonl de un directorio de proyecto con un
+# cache INCREMENTAL POR FICHERO.
+#
+# Usage: scan_project_records <projects_dir> <rec_cache_dir>
+# Escribe en stdout el stream de records (7 campos por linea).
+#
+# POR QUE incremental (2026-10-26, LZT): el scan completo son 710 ficheros /
+# 2481 MB de JSONL que jq parsea entero en cada invocacion del script
+# (medido: 38 s y ~75 MB/s de I/O sostenido -> io.pressure full 55-72% en el
+# PSI del host). Entre invocaciones solo cambian las sesiones ACTIVAS (1-5
+# ficheros); el resto no ha cambiado y no hace falta reparsearlo.
+#
+#   records.dat : "<ruta>\t<record>" por linea  (record = 7 campos)
+#   index.tsv   : "<mtime>\t<size>\t<ruta>" por linea
+#
+# Rebuild: un awk de una pasada conserva los records de los ficheros que NO
+# han cambiado (y descarta los que ya no son candidatos) y se anexan los
+# nuevos de jq. El agregado final no depende del orden, asi que no hace
+# falta ordenar nada.
+scan_project_records() {
+    local proj_dir="$1"
+    local rec_dir="$2"
+    local records_file="${rec_dir}/records.dat"
+    local index_file="${rec_dir}/index.tsv"
+
+    mkdir -p "$rec_dir" 2>/dev/null || return 0
+
+    local cand changed new_records tmp_records
+    cand=$(mktemp "${TMPDIR:-/tmp}/ccu-cand.XXXXXX") || return 0
+    changed=$(mktemp "${TMPDIR:-/tmp}/ccu-changed.XXXXXX") || return 0
+    new_records=$(mktemp "${TMPDIR:-/tmp}/ccu-newrec.XXXXXX") || return 0
+
+    # Candidatos: mtime (entero) | size | ruta
+    #
+    # 2026-10-26 (LZT): antes el `find` iba por un pipe a awk con `|| true`,
+    # que se tragaba el error. `-printf` es de GNU find: en un find que no lo
+    # soporta la lista de candidatos sale VACIA, y "find fallo" es
+    # indistinguible de "no ha cambiado nada" -> el indice se reescribia
+    # vacio y la siguiente pasada creia que TODOS los ficheros habian
+    # cambiado (reparseo completo de 2.5 GB). Ahora el codigo de retorno de
+    # find se lee: si falla, NO se toca el cache (se conserva el ultimo
+    # estado valido) y se emite el contenido anterior.
+    local raw_cand
+    raw_cand=$(mktemp "${TMPDIR:-/tmp}/ccu-rawcand.XXXXXX") || return 0
+    if ! find "$proj_dir" -name "*.jsonl" -mtime -31 -printf '%T@\t%s\t%p\n' \
+            > "$raw_cand" 2>/dev/null; then
+        echo "ccu: find fallo sobre $proj_dir; se conserva el cache previo" >&2
+        rm -f "$raw_cand" 2>/dev/null || true
+        if [[ -r "$records_file" ]]; then
+            cut -f2- "$records_file" 2>/dev/null || true
+        fi
+        return 0
+    fi
+    awk -F'\t' '{ split($1, t, "."); printf "%d\t%s\t%s\n", t[1], $2, $3 }' \
+        "$raw_cand" > "$cand" 2>/dev/null || true
+    rm -f "$raw_cand" 2>/dev/null || true
+
+    # mtime/size previos por ruta
+    #
+    # 2026-10-26 (LZT): `local -A old_mtime old_size` (sin inicializador)
+    # deja el array DECLARADO pero SIN ASIGNAR. Con `set -u` del script,
+    # `${#old_mtime[@]}` sobre el array no asignado aborta con
+    # "old_mtime: variable sin asignar" (bash 5.3), y como la funcion se
+    # invoca dentro de un pipe, el subshell moria y el pipeline entero
+    # devolvia 0 lineas => WEEK_TOKENS=0 SIEMPRE. Con `=()` el array
+    # queda vacio pero asignado.
+    local -A old_mtime=() old_size=()
+    if [[ -r "$index_file" ]]; then
+        while IFS=$'\t' read -r om os op; do
+            [[ -n "$op" ]] || continue
+            old_mtime["$op"]="$om"
+            old_size["$op"]="$os"
+        done < "$index_file"
+    fi
+
+    # Clasificar: sin cambios -> se reutiliza; con cambios -> se reparsea
+    local -a changed_paths=()
+    local -A cand_paths=()
+    local c_mtime c_size c_path n_changed=0
+    : > "$changed"
+    while IFS=$'\t' read -r c_mtime c_size c_path; do
+        [[ -n "$c_path" ]] || continue
+        cand_paths["$c_path"]=1
+        if [[ "${old_mtime[$c_path]:-}" == "$c_mtime" && "${old_size[$c_path]:-}" == "$c_size" ]]; then
+            continue
+        fi
+        changed_paths+=("$c_path")
+        n_changed=$((n_changed + 1))
+        printf '%s\t%s\t%s\n' "$c_path" "$c_mtime" "$c_size" >> "$changed"
+    done < "$cand"
+
+    # Podados: estaban en el indice anterior y ya NO son candidatos
+    # (borrados, o fuera de la ventana de -mtime -31). Si no se detectan,
+    # el rebuild no puede descartar sus records y por tanto no se toca
+    # records.dat (ver la nota de la rama de rebuild mas abajo).
+    local n_pruned=0 p
+    if [[ ${#old_mtime[@]} -gt 0 ]]; then
+        for p in "${!old_mtime[@]}"; do
+            if [[ -z "${cand_paths[$p]:-}" ]]; then
+                n_pruned=$((n_pruned + 1))
+            fi
+        done
+    fi
+
+    # Extraer los records de los ficheros cambiados. jq lee los ficheros
+    # directamente (sin el pipe de `cat`, que copiaba 2481 MB) y usa
+    # input_filename para etiquetar cada record con su fichero origen.
+    if [[ $n_changed -gt 0 ]]; then
+        jq -r -R 'fromjson? | select(.type == "assistant")
+            # Bucket by LOCAL calendar date, not UTC. Timestamps are ISO-8601 UTC
+            # (e.g. 2026-06-30T00:10:33Z); convert to the local date so the daily
+            # boundaries match TODAY/WEEK_START/MONTH_START (computed via local `date`)
+            # and the widget'"'"'s todayIndex. Falls back to the raw UTC slice if parsing
+            # fails or jq lacks strflocaltime (see JQ_DATE_EXPR probe above).
+            | (.timestamp // "") as $ts
+            | ('"$JQ_DATE_EXPR"') as $d
+            | (input_filename + "\t" + "\($d) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown")")' \
+            "${changed_paths[@]}" > "$new_records" 2>/dev/null || true
+    fi
+
+    # Rebuild de records.dat: conservar los records de los ficheros que NO
+    # han cambiado. Los ficheros que ya no son candidatos (aged out del
+    # -mtime -31 o borrados) se descartan aqui.
+    #
+    # 2026-10-26 (LZT) — BUG DE PERDA DE DATOS:
+    # la condicion era `[[ -r "$records_file" ]] && [[ $n_changed -gt 0 ]]`.
+    # Con n_changed == 0 — que es el caso NORMAL cuando el cache
+    # incremental funciona como debe, porque no ha cambiado ningun .jsonl —
+    # se tomaba la rama else, que hacia `: > "$tmp_records"`, y el
+    # `mv` siguiente dejaba records.dat con 0 bytes. `cut -f2-` no emitia
+    # nada => WEEK_TOKENS=0 en cada pasada sin cambios. Medido por el
+    # subagente: p1=1234567, p2=0, p3=1234678, p4=0.
+    #
+    # Ahora hay TRES estados, no dos:
+    #   - algo cambio                  -> rebuild (conservar + reparsear + podar)
+    #   - algo se podo                 -> rebuild (solo podar)
+    #   - nada cambio ni se podo       -> records.dat NO SE TOCA
+    tmp_records="${records_file}.new"
+    local need_rebuild=0 records_ok=1
+    if (( n_changed > 0 )); then need_rebuild=1; fi
+    if (( n_pruned > 0 )); then need_rebuild=1; fi
+
+    if [[ ! -r "$records_file" ]]; then
+        # Primera pasada (o cache borrado): records.dat = solo los nuevos.
+        if cat "$new_records" > "$tmp_records" 2>/dev/null; then
+            mv -f "$tmp_records" "$records_file" 2>/dev/null || { records_ok=0; rm -f "$tmp_records" 2>/dev/null || true; }
+        else
+            records_ok=0
+            rm -f "$tmp_records" 2>/dev/null || true
+        fi
+    elif (( need_rebuild == 1 )); then
+        # El awk conserva los records de los ficheros que no cambiaron y
+        # descarta los que ya no son candidatos. Si el awk falla NO se
+        # sustituye records.dat: el fallback original (`|| : > "$tmp_records"`)
+        # dejaba el fichero vacio y perdia TODOS los records.
+        if awk -F'\t' -v cand_list="$cand" -v changed_list="$changed" '
+            BEGIN {
+                while ((getline line < cand_list) > 0) {
+                    split(line, a, "\t")
+                    keep[a[3]] = 1
+                }
+                while ((getline line < changed_list) > 0) {
+                    split(line, a, "\t")
+                    drop[a[1]] = 1
+                }
+                close(cand_list)
+                close(changed_list)
+            }
+            { if (($1 in keep) && !($1 in drop)) print }
+        ' "$records_file" > "$tmp_records" 2>/dev/null; then
+            cat "$new_records" >> "$tmp_records" 2>/dev/null || true
+            mv -f "$tmp_records" "$records_file" 2>/dev/null || { records_ok=0; rm -f "$tmp_records" 2>/dev/null || true; }
+        else
+            records_ok=0
+            rm -f "$tmp_records" 2>/dev/null || true
+        fi
+    fi
+    # (n_changed == 0 && n_pruned == 0) -> records.dat intacto.
+
+    # Index nuevo = los candidatos actuales (los ficheros borrados desaparecen
+    # del indice solos). Escritura atomica (tmp + mv) como la del cache de
+    # tokens: el widget puede lanzar dos invocaciones solapadas y un `cp` en
+    # sitio deja el indice a medias si el proceso muere entre el truncate y
+    # la escritura.
+    #
+    # Solo se actualiza si records.dat quedo consistente: si el rebuild
+    # fallo y el indice avanzara, la siguiente pasada creeria que los
+    # ficheros modificados ya estan al dia y sus records no se volverian a
+    # collected nunca (perdida permanente).
+    if (( records_ok == 1 )); then
+        local idx_tmp="${index_file}.new"
+        if cat "$cand" > "$idx_tmp" 2>/dev/null; then
+            mv -f "$idx_tmp" "$index_file" 2>/dev/null || rm -f "$idx_tmp" 2>/dev/null || true
+        else
+            rm -f "$idx_tmp" 2>/dev/null || true
+        fi
+    fi
+
+    cut -f2- "$records_file" 2>/dev/null || true
+
+    rm -f "$cand" "$changed" "$new_records" 2>/dev/null || true
+    return 0
+}
+
 # --- Per-profile token counting ---
 # Usage: count_profile_tokens <projects_dir> <tmpfile>
 # Writes WEEK_TOKENS=N, WEEK_MESSAGES=N, ... to tmpfile
@@ -137,16 +377,31 @@ count_profile_tokens() {
         day_dates="${day_dates:+${day_dates},}${d}"
     done
 
-    find "$proj_dir" -name "*.jsonl" -mtime -31 -exec cat {} + 2>/dev/null \
-        | jq -r -R 'fromjson? | select(.type == "assistant")
-            # Bucket by LOCAL calendar date, not UTC. Timestamps are ISO-8601 UTC
-            # (e.g. 2026-06-30T00:10:33Z); convert to the local date so the daily
-            # boundaries match TODAY/WEEK_START/MONTH_START (computed via local `date`)
-            # and the widget'"'"'s todayIndex. Falls back to the raw UTC slice if parsing
-            # fails or jq lacks strflocaltime (see JQ_DATE_EXPR probe above).
-            | (.timestamp // "") as $ts
-            | ('"$JQ_DATE_EXPR"') as $d
-            | "\($d) \(.message.model // "unknown") \(.message.usage.input_tokens // 0) \(.message.usage.output_tokens // 0) \(.message.usage.cache_read_input_tokens // 0) \(.message.usage.cache_creation_input_tokens // 0) \(.sessionId // "unknown")"' \
+    # --- CACHE (2026-10-26, LZT) ------------------------------------------
+    # Ver la nota de TOKEN_CACHE_TTL arriba: el scan de abajo son 2481 MB de
+    # JSON que jq parsea entero, en cada invocacion del script. Con TTL, el
+    # scan solo corre cuando el cache expira.
+    local cache_key cache_file cache_stamp cache_epoch now_epoch want_stamp
+    now_epoch=$(date +%s)
+    cache_key=$(printf '%s' "$proj_dir" | sha256sum | cut -c1-16)
+    cache_file="${TOKEN_CACHE_DIR}/tokens-${cache_key}.env"
+    want_stamp="v1|${WEEK_START}|${MONTH_START}|${TODAY}"
+    if [[ -r "$cache_file" ]]; then
+        cache_stamp=$(head -1 "$cache_file" 2>/dev/null || true)
+        cache_epoch=$(sed -n 's/^EPOCH=//p' "$cache_file" 2>/dev/null | head -1)
+        if [[ "$cache_stamp" == "STAMP=$want_stamp" ]] \
+           && [[ "$cache_epoch" =~ ^[0-9]+$ ]] \
+           && (( now_epoch - cache_epoch < TOKEN_CACHE_TTL )); then
+            if tail -n +3 "$cache_file" 2>/dev/null > "$out_file"; then
+                return 0
+            fi
+        fi
+    fi
+    # --- fin cache TTL -----------------------------------------------------
+    # El scan usa el cache incremental por fichero (scan_project_records):
+    # solo se reparsean los .jsonl que han cambiado desde la ultima pasada.
+
+    scan_project_records "$proj_dir" "${TOKEN_CACHE_DIR}/recs/${cache_key}" 2>/dev/null \
         | awk -v week_start="$WEEK_START" -v month_start="$MONTH_START" -v today="$TODAY" -v day_dates="$day_dates" -v pricing="$PRICING_AWK" '
         BEGIN {
             split(day_dates, dates, ",")
@@ -224,6 +479,17 @@ count_profile_tokens() {
             printf "WEEK_COST=%.2f\n", week_cost + 0
             printf "MONTH_COST=%.2f\n", month_cost + 0
         }' > "$out_file" 2>/dev/null || true
+
+    # --- escribir cache (2026-10-26, LZT) ---------------------------------
+    # Escritura atomica (tmp + mv) porque el widget puede lanzar dos
+    # invocaciones solapadas (el fix del QML reduce eso, pero no lo elimina).
+    if [[ -d "$TOKEN_CACHE_DIR" ]]; then
+        local ctmp="${cache_file}.$$.tmp"
+        { echo "STAMP=$want_stamp"; echo "EPOCH=$now_epoch"; cat "$out_file"; } \
+            > "$ctmp" 2>/dev/null && mv -f "$ctmp" "$cache_file" 2>/dev/null \
+            || rm -f "$ctmp" 2>/dev/null || true
+    fi
+    return 0
 }
 
 # --- Per-profile credentials + API usage fetcher ---
