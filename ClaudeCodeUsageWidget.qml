@@ -28,7 +28,25 @@ PluginComponent {
     // Settings
     property int refreshInterval: (pluginData.refreshInterval || 2) * 60000
     property bool showPacing: pluginData.showPacing !== false
-    property var customProfiles: pluginData.customProfiles || []
+    // 2026-10-26 (LZT): `pluginData.customProfiles` es `undefined` cuando
+    // plugin_settings.json no define perfiles (medido: el fichero solo tiene
+    // {"enabled": true}). El `|| []` de antes creaba un array NUEVO en cada
+    // re-evaluacion del binding; QML compara `property var` por identidad
+    // (!==), asi que `changed` se emitia en cada re-evaluacion =>
+    // onCustomProfilesChanged => usageProcess.running = true =>
+    // Quickshell RE-LANZA el Process => ~10 spawns/s (medido) => 2.5 GB de
+    // JSONL releido en bucle => tormenta de I/O (io.pressure full ~62%).
+    // Dos cambios:
+    //   1) `emptyCustomProfiles` = singleton estable (binding constante,
+    //      evaluado una vez) => `customProfiles` conserva la MISMA
+    //      identidad => no hay senal espuria.
+    //   2) `customProfilesKey` = clave string derivada del contenido =>
+    //      el handler dispara ante un cambio REAL de perfiles, aunque DMS
+    //      re-emita un array nuevo con el mismo contenido (identidad
+    //      distinta, contenido igual).
+    readonly property var emptyCustomProfiles: []
+    property var customProfiles: pluginData.customProfiles ? pluginData.customProfiles : emptyCustomProfiles
+    readonly property string customProfilesKey: JSON.stringify(pluginData.customProfiles || [])
     property bool customProfilesRefreshPending: false
 
     // API usage data
@@ -687,8 +705,12 @@ PluginComponent {
 
     // --- Data fetching ---
 
-    // Pick up an added/removed profile now instead of waiting for the refresh timer
-    onCustomProfilesChanged: {
+    // Pick up an added/removed profile now instead of waiting for the refresh timer.
+    // 2026-10-26 (LZT): escucha `customProfilesKey` (string) en vez de
+    // `customProfiles` (var). Con `var`, cada re-evaluacion del binding
+    // emitia `changed` (comparacion por identidad) y relanzaba el Process
+    // en bucle. Ver la nota de `customProfiles` mas arriba.
+    onCustomProfilesKeyChanged: {
         if (usageProcess.running)
             customProfilesRefreshPending = true;
         else
